@@ -26,7 +26,7 @@ class MLPPlanner(nn.Module):
 
         self.n_track = n_track
         self.n_waypoints = n_waypoints
-        in_dim = n_track * 2 * 2  # left/right, each with (x,y)
+        in_dim = n_track * 4 * 2  # left/right, each with (x,y)
         layers = []
         last = in_dim
         for h in hidden_dims:
