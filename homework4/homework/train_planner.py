@@ -10,18 +10,16 @@ Usage:
 
 import argparse
 import math
-from typing import Tuple
+from pathlib import Path
+from typing import Tuple, Optional
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset, random_split
 
 from homework.models import load_model, save_model
 from homework.datasets.road_dataset import RoadDataset
 from homework.metrics import PlannerMetric
-
-from pathlib import Path
-from torch.utils.data import DataLoader, ConcatDataset, random_split
 
 
 def parse_args():
@@ -43,63 +41,125 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def build_loaders(batch_size: int, num_workers: int, device: torch.device):
+# ---------------------------
+# Dataset discovery utilities
+# ---------------------------
+
+_EP_EXTS = (".npz", ".npy", ".pkl", ".pt", ".json", ".jsonl")
+
+
+def _possible_roots() -> list[Path]:
+    """Try a few likely places for drive_data/ so cwd quirks don't break things."""
+    here = Path.cwd()
+    return [
+        here / "drive_data",
+        here.parent / "drive_data",
+        Path(__file__).resolve().parent.parent / "drive_data",  # project root (../ from homework/)
+    ]
+
+
+def _find_drive_data_root() -> Path:
+    for cand in _possible_roots():
+        if cand.exists():
+            return cand
+    raise FileNotFoundError(
+        "drive_data/ not found. cd to your project root (where bundle.py is) and unzip the dataset there."
+    )
+
+
+def _collect_episode_files(split_dir: Path) -> list[Path]:
     """
-    Build datasets by scanning drive_data/ for per-episode paths and
-    instantiating RoadDataset(episode_path=...) for each.
+    Collect per-episode file paths (or directories treated as episodes) under split_dir.
+    We prefer data files with common extensions; if none, fall back to subdirectories.
     """
-    pin = device.type == "cuda"
+    files = []
+    for ext in _EP_EXTS:
+        files.extend(split_dir.rglob(f"*{ext}"))
+    files = sorted({p for p in files if p.is_file()})
 
-    root = Path("drive_data")
-    if not root.exists():
-        raise FileNotFoundError("drive_data/ not found. Did you unzip the dataset in the repo root?")
+    if files:
+        return files
 
-    # 1) Collect candidate episode paths
-    #    First try subdirectories (most common), else look for episode files.
-    episode_dirs = [p for p in root.iterdir() if p.is_dir()]
-    episode_files = list(root.glob("*.npz")) + list(root.glob("*.pkl")) + list(root.glob("*.pt"))
+    # Fallback: treat immediate subdirs as episodes
+    subdirs = sorted([p for p in split_dir.iterdir() if p.is_dir()])
+    return subdirs
 
-    candidates = sorted(episode_dirs if episode_dirs else episode_files)
-    if not candidates:
-        # Last resort: deep search
-        candidates = sorted([p for p in root.rglob("*") if p.is_dir()])
-    if not candidates:
-        raise RuntimeError(
-            "No episode paths found under drive_data/. "
-            "List its contents and ensure you downloaded + unzipped correctly."
-        )
 
-    # 2) Try to instantiate RoadDataset for each candidate
+def _try_instantiate_episode(ep_path: Path):
+    """
+    Try common constructor signatures for a single episode.
+    Returns a RoadDataset or None.
+    """
+    # 1) episode_path=
+    try:
+        return RoadDataset(episode_path=str(ep_path))
+    except TypeError:
+        pass
+    except Exception:
+        return None
+
+    # 2) path=
+    try:
+        return RoadDataset(path=str(ep_path))
+    except Exception:
+        return None
+
+    # 3) dir=  (rare)
+    try:
+        return RoadDataset(dir=str(ep_path))
+    except Exception:
+        return None
+
+
+def _build_split_dataset(split_dir: Path) -> ConcatDataset:
+    ep_candidates = _collect_episode_files(split_dir)
+    if not ep_candidates:
+        raise RuntimeError(f"No episode files/dirs found under {split_dir}")
+
     datasets = []
-    for p in candidates:
-        try:
-            ds = RoadDataset(episode_path=str(p))
+    for p in ep_candidates:
+        ds = _try_instantiate_episode(p)
+        if ds is not None:
             datasets.append(ds)
-        except TypeError:
-            # signature mismatch? skip this candidate
-            continue
-        except Exception:
-            # bad episode? skip
-            continue
 
     if not datasets:
-        # Helpful diagnostics
-        sample = "\n".join([str(p) for p in candidates[:10]])
+        sample = "\n".join(str(p) for p in ep_candidates[:10])
         raise RuntimeError(
-            "Could not instantiate any RoadDataset(episode_path=...). "
-            f"Tried {len(candidates)} candidates, e.g.:\n{sample}\n"
+            f"Could not instantiate RoadDataset for any candidate under {split_dir}.\n"
+            f"Tried {len(ep_candidates)} paths, sample:\n{sample}\n"
             "Open homework/datasets/road_dataset.py and check __init__ signature; "
-            "adjust build_loaders accordingly."
+            "adjust _try_instantiate_episode() param name accordingly."
         )
 
-    full = ConcatDataset(datasets)
+    return ConcatDataset(datasets)
 
-    # 3) Train/val split
-    n = len(full)
-    n_train = max(1, int(0.9 * n))
-    n_val = max(1, n - n_train)
-    gen = torch.Generator().manual_seed(1337)
-    train_ds, val_ds = random_split(full, [n_train, n_val], generator=gen)
+
+def build_loaders(batch_size: int, num_workers: int, device: torch.device):
+    """
+    Build train/val loaders by scanning:
+        drive_data/train/**  and  drive_data/val/**
+    for episode files/dirs, instantiating one dataset per episode, then concatenating.
+    Falls back to a single dataset split if no explicit train/val dirs exist.
+    """
+    pin = device.type == "cuda"
+    root = _find_drive_data_root()
+
+    train_dir = root / "train"
+    val_dir = root / "val"
+
+    if train_dir.exists() and val_dir.exists():
+        print(f"[build_loaders] Using split dirs: {train_dir} | {val_dir}")
+        train_ds = _build_split_dataset(train_dir)
+        val_ds = _build_split_dataset(val_dir)
+    else:
+        # No explicit split: attempt to build from the whole root, then random split.
+        print(f"[build_loaders] No train/val dirs; building from {root} and random-splitting.")
+        full_ds = _build_split_dataset(root)
+        n = len(full_ds)
+        n_train = max(1, int(0.9 * n))
+        n_val = max(1, n - n_train)
+        gen = torch.Generator().manual_seed(1337)
+        train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=gen)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
@@ -109,8 +169,13 @@ def build_loaders(batch_size: int, num_workers: int, device: torch.device):
         val_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=pin
     )
-    print(f"[build_loaders] episodes={len(datasets)} | samples total={n} | split {n_train}/{n_val}")
+    print(f"[build_loaders] train_samples≈{len(train_ds)} | val_samples≈{len(val_ds)}")
     return train_loader, val_loader
+
+
+# ---------------------------
+# Training / Eval
+# ---------------------------
 
 def forward_model(model: torch.nn.Module, batch: dict, device: torch.device) -> torch.Tensor:
     name = model.__class__.__name__.lower()
