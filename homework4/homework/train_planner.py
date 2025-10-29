@@ -40,11 +40,70 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def build_loaders(batch_size: int, num_workers: int, device: torch.device) -> Tuple[DataLoader, DataLoader]:
-    train_ds = RoadDataset(split="train")
-    val_ds = RoadDataset(split="val")
-
+def build_loaders(batch_size: int, num_workers: int, device: torch.device):
+    """
+    Tries common constructor signatures for RoadDataset:
+      - RoadDataset(split="train"/"val")
+      - RoadDataset(partition=...)
+      - RoadDataset(split_name=...)
+      - RoadDataset(mode=...)
+      - RoadDataset(train=True/False)
+    Falls back to: RoadDataset() then random 90/10 split.
+    """
     pin = device.type == "cuda"
+
+    # Try multiple constructor styles
+    def _try_ctor(argname, train_val_mapper):
+        try:
+            train_ds = RoadDataset(**{argname: train_val_mapper("train")})
+            val_ds   = RoadDataset(**{argname: train_val_mapper("val")})
+            print(f"[build_loaders] Using RoadDataset({argname}=...)")
+            return train_ds, val_ds
+        except TypeError:
+            return None
+        except Exception:
+            return None
+
+    # 1) split="train"/"val"
+    pair = _try_ctor("split", lambda s: s)
+    if pair is None:
+        # 2) partition="train"/"val"
+        pair = _try_ctor("partition", lambda s: s)
+    if pair is None:
+        # 3) split_name="train"/"val"
+        pair = _try_ctor("split_name", lambda s: s)
+    if pair is None:
+        # 4) mode="train"/"val"
+        pair = _try_ctor("mode", lambda s: s)
+    if pair is None:
+        # 5) train=True/False
+        try:
+            train_ds = RoadDataset(train=True)
+            val_ds   = RoadDataset(train=False)
+            print("[build_loaders] Using RoadDataset(train=True/False)")
+            pair = (train_ds, val_ds)
+        except TypeError:
+            pair = None
+        except Exception:
+            pair = None
+
+    if pair is None:
+        # 6) Fallback: single dataset → random split
+        try:
+            base = RoadDataset()
+            n = len(base)
+            n_train = max(1, int(0.9 * n))
+            n_val = max(1, n - n_train)
+            gen = torch.Generator().manual_seed(1337)
+            train_ds, val_ds = random_split(base, [n_train, n_val], generator=gen)
+            print(f"[build_loaders] Using RoadDataset() and random_split {n_train}/{n_val}")
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not construct RoadDataset with any known signature; original error: {e}"
+            )
+    else:
+        train_ds, val_ds = pair
+
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=pin, drop_last=True
@@ -54,6 +113,7 @@ def build_loaders(batch_size: int, num_workers: int, device: torch.device) -> Tu
         num_workers=num_workers, pin_memory=pin
     )
     return train_loader, val_loader
+
 
 
 def forward_model(model: torch.nn.Module, batch: dict, device: torch.device) -> torch.Tensor:
