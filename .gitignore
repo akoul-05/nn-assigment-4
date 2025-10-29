@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Jupyter/Colab
+.ipynb_checkpoints/
+*.ipynb
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Project-specific large files
+drive_data/
+drive_data.zip
+videos/
+*.mp4
+*.mov
+
+# Model weights / artifacts
+*.th
+*.pt
+*.pth
+logs/
+wandb/
+
+# Caches
+.cache/
