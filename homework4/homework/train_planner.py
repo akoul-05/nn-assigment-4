@@ -178,20 +178,15 @@ def forward_model(model: torch.nn.Module, batch: dict, device: torch.device) -> 
 def compute_loss(pred, batch, device):
     target = batch["waypoints"].to(device)
     mask = batch.get("waypoints_mask", None)
-
-    abs_err = (pred - target).abs()
-
-    comp_weight = torch.tensor([1.0, 1.5], device=device)
+    abs_err = torch.nn.functional.smooth_l1_loss(pred, target, beta=0.1, reduction="none")
+    comp_weight = torch.tensor([1.0, 1.8], device=device)
     abs_err = abs_err * comp_weight.view(1, 1, 2)
-
-    
 
     if mask is not None:
         m = mask.to(device)[..., None].float()
-        loss = (abs_err * m).sum() / m.sum().clamp_min(1.0)
+        return (abs_err * m).sum() / m.sum().clamp_min(1.0)
     else:
-        loss = abs_err.mean()
-    return loss
+        return abs_err.mean()
 
 @torch.no_grad()
 def evaluate(model: torch.nn.Module, val_loader: DataLoader, device: torch.device):

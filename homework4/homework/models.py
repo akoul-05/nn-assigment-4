@@ -27,16 +27,16 @@ class MLPPlanner(nn.Module):
 
         self.n_track = n_track
         self.n_waypoints = n_waypoints
-        in_dim = n_track * 4 * 2
-        
+        in_dim = n_track * 4 * 4
+
         self.net = nn.Sequential(
             nn.LayerNorm(in_dim),
             nn.Linear(in_dim, 512),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.05),
             nn.Linear(512, 512),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.05),
             nn.Linear(512, 256),
             nn.GELU(),
             nn.Linear(256, n_waypoints * 2),
