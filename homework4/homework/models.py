@@ -28,13 +28,19 @@ class MLPPlanner(nn.Module):
         self.n_track = n_track
         self.n_waypoints = n_waypoints
         in_dim = n_track * 4 * 2
-        layers = []
-        last = in_dim
-        for h in hidden_dims:
-            layers += [nn.Linear(last, h), nn.GELU()]
-            last = h
-        layers += [nn.Linear(last, n_waypoints * 2)]
-        self.net = nn.Sequential(*layers)
+        
+        self.net = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, 512),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, 512),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Linear(256, n_waypoints * 2),
+        )
 
     def forward(
         self,

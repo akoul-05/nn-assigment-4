@@ -184,6 +184,8 @@ def compute_loss(pred, batch, device):
     comp_weight = torch.tensor([1.0, 1.5], device=device)
     abs_err = abs_err * comp_weight.view(1, 1, 2)
 
+    
+
     if mask is not None:
         m = mask.to(device)[..., None].float()
         loss = (abs_err * m).sum() / m.sum().clamp_min(1.0)
