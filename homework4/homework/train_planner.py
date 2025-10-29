@@ -17,13 +17,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, ConcatDataset, random_split
 
-from homework.models import load_model, save_model
+from homework.models import load_model
 from homework.datasets.road_dataset import RoadDataset
 from homework.metrics import PlannerMetric
 
-# Used Copilot & Chatgpt to help implement the models below; most of the code was referenced
-
-# alot of this code was nuanced and used for my google collab help.
+# ---------- CLI ----------
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -36,6 +34,12 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=1337)
+
+    # best model saving / early stop
+    p.add_argument("--save_metric", type=str, default="lateral",
+                   choices=["val_loss", "lateral", "longitudinal", "l1"])
+    p.add_argument("--min_delta", type=float, default=1e-4)
+    p.add_argument("--patience", type=int, default=0)  # 0 = no early stop
     return p.parse_args()
 
 
@@ -43,8 +47,9 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-EP_KEY_FILE = "info.npz"  # file that marks an episode directory (e.g., drive_data/train/*/info.npz)
+# ---------- Dataset discovery ----------
 
+EP_KEY_FILE = "info.npz"  # marks an episode directory
 
 def _possible_roots() -> list[Path]:
     here = Path.cwd()
@@ -63,9 +68,7 @@ def _find_drive_data_root() -> Path:
     )
 
 def _collect_episode_dirs(split_dir: Path) -> list[Path]:
-    """
-    Find episode directories by locating */info.npz and returning their parents.
-    """
+    # Find */info.npz and return the parent dirs
     info_files = list(split_dir.rglob(EP_KEY_FILE))
     ep_dirs = sorted({p.parent for p in info_files if p.is_file()})
     if ep_dirs:
@@ -78,28 +81,20 @@ def _collect_episode_dirs(split_dir: Path) -> list[Path]:
             candidates.append(d)
     return candidates
 
-
 def _try_instantiate_episode(ep_dir: Path):
-    """
-    Try common constructor signatures using the EPISODE DIRECTORY.
-    Returns a RoadDataset or None.
-    """
-    # Most common: episode_path=<dir>
+    # Try common constructor signatures
     try:
         return RoadDataset(episode_path=str(ep_dir))
     except TypeError:
         pass
     except Exception:
         return None
-
-    # Other names some repos use
     for kw in ("path", "dir", "episode_dir"):
         try:
             return RoadDataset(**{kw: str(ep_dir)})
         except Exception:
             continue
     return None
-
 
 def _build_split_dataset(split_dir: Path) -> ConcatDataset:
     ep_dirs = _collect_episode_dirs(split_dir)
@@ -119,19 +114,16 @@ def _build_split_dataset(split_dir: Path) -> ConcatDataset:
         raise RuntimeError(
             f"Could not instantiate RoadDataset for any episode dir under {split_dir}.\n"
             f"Tried {len(ep_dirs)} dirs, e.g.:\n{sample}\n"
-            "Open homework/datasets/road_dataset.py and confirm the parameter name. "
-            "Supported keys here: episode_path / path / dir / episode_dir."
+            "Check homework/datasets/road_dataset.py init parameters (episode_path / path / dir / episode_dir)."
         )
 
     return ConcatDataset(datasets)
-
 
 def build_loaders(batch_size: int, num_workers: int, device: torch.device):
     """
     Build train/val loaders by scanning:
         drive_data/train/*/info.npz  and  drive_data/val/*/info.npz
-    and instantiating one RoadDataset per episode directory. If no explicit split
-    exists, build from the whole root and perform a 90/10 random split.
+    Falls back to building from root and random-splitting if no split dirs exist.
     """
     pin = device.type == "cuda"
     root = _find_drive_data_root()
@@ -144,7 +136,7 @@ def build_loaders(batch_size: int, num_workers: int, device: torch.device):
         train_ds = _build_split_dataset(train_dir)
         val_ds = _build_split_dataset(val_dir)
     else:
-        print(f"[build_loaders] ISSUE: No train/val dirs; building from {root} and random-splitting.")
+        print(f"[build_loaders] No train/val dirs; building from {root} and random-splitting.")
         full_ds = _build_split_dataset(root)
         n = len(full_ds)
         n_train = max(1, int(0.9 * n))
@@ -163,6 +155,7 @@ def build_loaders(batch_size: int, num_workers: int, device: torch.device):
     print(f"[build_loaders] train_samples≈{len(train_ds)} | val_samples≈{len(val_ds)}")
     return train_loader, val_loader
 
+# ---------- Train / Eval ----------
 
 def forward_model(model: torch.nn.Module, batch: dict, device: torch.device) -> torch.Tensor:
     name = model.__class__.__name__.lower()
@@ -174,12 +167,13 @@ def forward_model(model: torch.nn.Module, batch: dict, device: torch.device) -> 
             track_right=batch["track_right"].to(device),
         )
 
-
 def compute_loss(pred, batch, device):
     target = batch["waypoints"].to(device)
     mask = batch.get("waypoints_mask", None)
-    abs_err = torch.nn.functional.smooth_l1_loss(pred, target, beta=0.1, reduction="none")
-    comp_weight = torch.tensor([1.0, 1.8], device=device)
+
+    # Smooth L1 stabilizes training a bit; weight lateral error higher
+    abs_err = F.smooth_l1_loss(pred, target, beta=0.1, reduction="none")  # (B, 3, 2)
+    comp_weight = torch.tensor([1.0, 1.8], device=device)  # [longitudinal, lateral]
     abs_err = abs_err * comp_weight.view(1, 1, 2)
 
     if mask is not None:
@@ -193,7 +187,6 @@ def evaluate(model: torch.nn.Module, val_loader: DataLoader, device: torch.devic
     model.eval()
     tot_loss = 0.0
     seen = 0
-
     metric = PlannerMetric()
 
     for batch in val_loader:
@@ -211,14 +204,25 @@ def evaluate(model: torch.nn.Module, val_loader: DataLoader, device: torch.devic
     m = metric.compute()
     return avg_loss, m["longitudinal_error"], m["lateral_error"], m["l1_error"]
 
+def pick_metric(val_loss, long_err, lat_err, l1_err, name: str):
+    if name == "val_loss":      return val_loss
+    if name == "lateral":       return lat_err
+    if name == "longitudinal":  return long_err
+    if name == "l1":            return l1_err
+    raise ValueError(f"Unknown metric {name}")
+
+# ---------- Main ----------
 
 def main():
+    import shutil
+
     args = parse_args()
     set_seed(args.seed)
 
     device = torch.device(args.device)
     print(f"Training {args.model} on {device} for {args.epochs} epochs")
 
+    # Slightly lower default WD for MLP unless overridden
     wd = 0.01 if (args.model == "mlp_planner" and args.weight_decay == 0.05) else args.weight_decay
 
     model = load_model(args.model).to(device)
@@ -226,18 +230,23 @@ def main():
 
     train_loader, val_loader = build_loaders(args.batch_size, args.num_workers, device)
 
-    best_val = math.inf
+    ckpt_dir = Path(__file__).resolve().parent  # homework/
+    best_path = ckpt_dir / f"{args.model}_best.th"
+    last_path = ckpt_dir / f"{args.model}_last.th"
+    required_path = ckpt_dir / f"{args.model}.th"  # grader expects this name
+
+    best_score = float("inf")
+    best_epoch = -1
+    no_improve = 0
+
     for epoch in range(1, args.epochs + 1):
         model.train()
-        running = 0.0
-        seen = 0
+        running, seen = 0.0, 0
 
         for step, batch in enumerate(train_loader, 1):
             optimizer.zero_grad(set_to_none=True)
-
-            pred = forward_model(model, batch, device)
-            loss = compute_loss(pred, batch, device)
-
+            pred  = forward_model(model, batch, device)
+            loss  = compute_loss(pred, batch, device)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -245,21 +254,41 @@ def main():
             bsz = pred.size(0)
             running += loss.item() * bsz
             seen += bsz
-
             if step % 50 == 0:
-                print(f"[Epoch {epoch} | {step}/{len(train_loader)}] train_loss={running/seen:.4f}")
+                print(f"[Epoch {epoch} | {step}/{len(train_loader)}] train_loss={running/max(1,seen):.4f}")
 
         val_loss, long_err, lat_err, l1_err = evaluate(model, val_loader, device)
         print(f"Epoch {epoch:03d} | val_loss={val_loss:.4f} | long={long_err:.3f} | lat={lat_err:.3f} | L1={l1_err:.3f}")
 
-        if val_loss < best_val:
-            best_val = val_loss
-            path = save_model(model)
-            print(f"✓ Saved best model to: {path}")
+        # Always save LAST
+        torch.save(model.state_dict(), last_path)
 
-    # Final save just in case
-    final_path = save_model(model)
-    print(f"Final model saved to: {final_path}")
+        # Save BEST according to chosen metric
+        score = pick_metric(val_loss, long_err, lat_err, l1_err, args.save_metric)
+        if score < best_score - args.min_delta:
+            best_score = score
+            best_epoch = epoch
+            torch.save(model.state_dict(), best_path)
+            print(f"✓ Saved BEST ({args.save_metric}={best_score:.4f}) to {best_path}")
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        # Optional early stopping
+        if args.patience > 0 and no_improve >= args.patience:
+            print(f"Early stopping: no improvement in {args.patience} epochs. "
+                  f"Best {args.save_metric}={best_score:.4f} at epoch {best_epoch}.")
+            break
+
+    # Copy BEST to the required filename for the grader; if BEST never saved, use LAST.
+    if best_path.exists():
+        shutil.copyfile(best_path, required_path)
+        print(f"Copied BEST -> {required_path.name}")
+    else:
+        shutil.copyfile(last_path, required_path)
+        print(f"No BEST found; copied LAST -> {required_path.name}")
+
+    print(f"Done. Best {args.save_metric}={best_score:.4f} at epoch {best_epoch}.")
 
 
 if __name__ == "__main__":
