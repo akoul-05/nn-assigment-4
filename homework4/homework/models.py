@@ -7,6 +7,7 @@ HOMEWORK_DIR = Path(__file__).resolve().parent
 INPUT_MEAN = [0.2788, 0.2657, 0.2629]
 INPUT_STD = [0.2064, 0.1944, 0.2252]
 
+# Used Copilot & Chatgpt to help implement the models below; most of the code was referenced.
 
 class MLPPlanner(nn.Module):
     def __init__(
@@ -26,7 +27,7 @@ class MLPPlanner(nn.Module):
 
         self.n_track = n_track
         self.n_waypoints = n_waypoints
-        in_dim = n_track * 4 * 2  # left/right, each with (x,y)
+        in_dim = n_track * 4 * 2
         layers = []
         last = in_dim
         for h in hidden_dims:
@@ -61,18 +62,11 @@ class MLPPlanner(nn.Module):
         # return out.view(b, self.n_waypoints, 2)
     
         b = track_left.size(0)
-
-        # Extra features
-        center = 0.5 * (track_left + track_right)   # (b, n_track, 2)
-        width  = (track_right - track_left)         # (b, n_track, 2)
-
-        # Concatenate: left, right, center, width  -> (b, 4*n_track, 2)
+        center = 0.5 * (track_left + track_right)
+        width  = (track_right - track_left)
         x = torch.cat([track_left, track_right, center, width], dim=1)
-
-        # Flatten to (b, in_dim) where in_dim = n_track * 4 * 2
         x = x.reshape(b, -1)
-
-        out = self.net(x)                            # (b, n_waypoints*2)
+        out = self.net(x)
         return out.view(b, self.n_waypoints, 2)
 
         #raise NotImplementedError
@@ -98,20 +92,15 @@ class TransformerPlanner(nn.Module):
 
         self.d_model = d_model
 
-        # Encode each (x,y) boundary point into d_model
         self.point_encoder = nn.Sequential(
             nn.Linear(2, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
 
-        # Side embedding to let model know left (0) vs right (1)
         self.side_embed = nn.Embedding(2, d_model)
-
-        # Learned queries: one per waypoint
         self.query_embed = nn.Embedding(n_waypoints, d_model)
 
-        # Transformer decoder: queries attend to boundary features (memory)
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -122,7 +111,7 @@ class TransformerPlanner(nn.Module):
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
-        # Project each query output to (x,y)
+        # Project query output to (x,y)
         self.head = nn.Linear(d_model, 2)
 
     def forward(
@@ -146,26 +135,24 @@ class TransformerPlanner(nn.Module):
         """
         b = track_left.size(0)
 
-        # Memory tokens: concat left then right boundary points
-        mem_xy = torch.cat([track_left, track_right], dim=1)      # (b, 2*n_track, 2)
-        mem = self.point_encoder(mem_xy)                           # (b, 2*n_track, d)
+        mem_xy = torch.cat([track_left, track_right], dim=1)     
+        mem = self.point_encoder(mem_xy)
 
-        # Add side embeddings
         side_ids = torch.cat(
             [
                 torch.zeros((b, self.n_track), dtype=torch.long, device=mem.device),
                 torch.ones((b, self.n_track), dtype=torch.long, device=mem.device),
             ],
             dim=1,
-        )  # (b, 2*n_track)
-        mem = mem + self.side_embed(side_ids)                      # (b, 2*n_track, d)
+        )
+        mem = mem + self.side_embed(side_ids)
 
-        # Queries (same learned vectors broadcast across batch)
-        q = self.query_embed.weight.unsqueeze(0).expand(b, -1, -1) # (b, n_waypoints, d)
+        # Queries
+        q = self.query_embed.weight.unsqueeze(0).expand(b, -1, -1)
 
-        # Cross-attention: queries attend to boundary memory
-        dec = self.decoder(tgt=q, memory=mem)                      # (b, n_waypoints, d)
-        out = self.head(dec)                                       # (b, n_waypoints, 2)
+        # Cross-attention
+        dec = self.decoder(tgt=q, memory=mem)
+        out = self.head(dec)
         return out
         #raise NotImplementedError
 
@@ -325,10 +312,8 @@ class ViTPlanner(torch.nn.Module):
         )
         num_patches = self.patch_embed.num_patches
 
-        # Learnable positional encodings for each patch token
         self.pos = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
 
-        # Encoder stack
         blocks = []
         for _ in range(num_layers):
             blocks.append(
@@ -337,7 +322,6 @@ class ViTPlanner(torch.nn.Module):
         self.blocks = nn.Sequential(*blocks)
         self.norm = nn.LayerNorm(embed_dim)
 
-        # Head to predict waypoints from a global pooled token
         self.head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
@@ -382,21 +366,21 @@ class ViTPlanner(torch.nn.Module):
         #x = image
         #x = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
 
-         # 1) Normalize
+        # 1) Normalize
         x = (image - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
 
-        # 2) Patchify → (B, N, D)
+        # 2) Patch
         x = self.patch_embed(x)
 
         # 3) Add positional encodings
         x = x + self.pos[:, : x.size(1), :]
 
-        # 4) Transformer encoder blocks
+        # 4) Transformer blocks
         x = self.blocks(x)
         x = self.norm(x)
 
         # 5) Global average pool over tokens
-        x = x.mean(dim=1)  # (B, D)
+        x = x.mean(dim=1)
 
         # 6) Project to waypoints
         out = self.head(x)  # (B, n_waypoints*2)

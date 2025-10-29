@@ -21,10 +21,9 @@ from homework.models import load_model, save_model
 from homework.datasets.road_dataset import RoadDataset
 from homework.metrics import PlannerMetric
 
+# Used Copilot & Chatgpt to help implement the models below; most of the code was referenced
 
-# ---------------------------
-# Arg parsing / seeding
-# ---------------------------
+# alot of this code was nuanced and used for my google collab help.
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -44,23 +43,16 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
-# ---------------------------
-# Dataset discovery utilities
-# ---------------------------
-
 EP_KEY_FILE = "info.npz"  # file that marks an episode directory (e.g., drive_data/train/*/info.npz)
 
 
 def _possible_roots() -> list[Path]:
-    """Try a few likely places for drive_data/ so cwd quirks don't break things."""
     here = Path.cwd()
     return [
         here / "drive_data",
         here.parent / "drive_data",
         Path(__file__).resolve().parent.parent / "drive_data",  # project root (../ from homework/)
     ]
-
 
 def _find_drive_data_root() -> Path:
     for cand in _possible_roots():
@@ -69,7 +61,6 @@ def _find_drive_data_root() -> Path:
     raise FileNotFoundError(
         "drive_data/ not found. cd to your project root (where bundle.py is) and unzip the dataset there."
     )
-
 
 def _collect_episode_dirs(split_dir: Path) -> list[Path]:
     """
@@ -153,8 +144,7 @@ def build_loaders(batch_size: int, num_workers: int, device: torch.device):
         train_ds = _build_split_dataset(train_dir)
         val_ds = _build_split_dataset(val_dir)
     else:
-        # No explicit split: attempt to build from the whole root, then random split.
-        print(f"[build_loaders] No train/val dirs; building from {root} and random-splitting.")
+        print(f"[build_loaders] ISSUE: No train/val dirs; building from {root} and random-splitting.")
         full_ds = _build_split_dataset(root)
         n = len(full_ds)
         n_train = max(1, int(0.9 * n))
@@ -174,10 +164,6 @@ def build_loaders(batch_size: int, num_workers: int, device: torch.device):
     return train_loader, val_loader
 
 
-# ---------------------------
-# Training / Eval
-# ---------------------------
-
 def forward_model(model: torch.nn.Module, batch: dict, device: torch.device) -> torch.Tensor:
     name = model.__class__.__name__.lower()
     if "vit" in name:
@@ -190,24 +176,20 @@ def forward_model(model: torch.nn.Module, batch: dict, device: torch.device) -> 
 
 
 def compute_loss(pred, batch, device):
-    target = batch["waypoints"].to(device)        # (B, 3, 2)
-    mask = batch.get("waypoints_mask", None)      # (B, 3) or None
+    target = batch["waypoints"].to(device)
+    mask = batch.get("waypoints_mask", None)
 
-    abs_err = (pred - target).abs()               # (B, 3, 2)
+    abs_err = (pred - target).abs()
 
-    # ↑ If dim 0 is longitudinal and dim 1 is lateral per your metric naming,
-    # increase weight on the *lateral* component (index 1):
-    comp_weight = torch.tensor([1.0, 1.5], device=device)  # [long, lat]
+    comp_weight = torch.tensor([1.0, 1.5], device=device)
     abs_err = abs_err * comp_weight.view(1, 1, 2)
 
     if mask is not None:
-        m = mask.to(device)[..., None].float()    # (B, 3, 1)
+        m = mask.to(device)[..., None].float()
         loss = (abs_err * m).sum() / m.sum().clamp_min(1.0)
     else:
         loss = abs_err.mean()
     return loss
-
-
 
 @torch.no_grad()
 def evaluate(model: torch.nn.Module, val_loader: DataLoader, device: torch.device):
@@ -218,7 +200,7 @@ def evaluate(model: torch.nn.Module, val_loader: DataLoader, device: torch.devic
     metric = PlannerMetric()
 
     for batch in val_loader:
-        pred = forward_model(model, batch, device)          # (B, 3, 2)
+        pred = forward_model(model, batch, device)
         loss = compute_loss(pred, batch, device)
         bsz = pred.size(0)
         tot_loss += loss.item() * bsz
@@ -240,7 +222,6 @@ def main():
     device = torch.device(args.device)
     print(f"Training {args.model} on {device} for {args.epochs} epochs")
 
-    # Heuristic: slightly lower default WD for MLP unless overridden
     wd = 0.01 if (args.model == "mlp_planner" and args.weight_decay == 0.05) else args.weight_decay
 
     model = load_model(args.model).to(device)
@@ -257,7 +238,7 @@ def main():
         for step, batch in enumerate(train_loader, 1):
             optimizer.zero_grad(set_to_none=True)
 
-            pred = forward_model(model, batch, device)      # (B, 3, 2)
+            pred = forward_model(model, batch, device)
             loss = compute_loss(pred, batch, device)
 
             loss.backward()
