@@ -13,7 +13,9 @@ class MLPPlanner(nn.Module):
         self,
         n_track: int = 10,
         n_waypoints: int = 3,
-        hidden_dims=(256, 256, 128),
+        # hidden_dims=(256, 256, 128),
+        hidden_dims=(512, 512, 256),
+
     ):
         """
         Args:
@@ -52,11 +54,27 @@ class MLPPlanner(nn.Module):
         Returns:
             torch.Tensor: future waypoints with shape (b, n_waypoints, 2)
         """
+        # b = track_left.size(0)
+        # x = torch.cat([track_left, track_right], dim=1)   # (b, 2*n_track, 2)
+        # x = x.reshape(b, -1)                              # (b, 4*n_track)
+        # out = self.net(x)                                 # (b, n_waypoints*2)
+        # return out.view(b, self.n_waypoints, 2)
+    
         b = track_left.size(0)
-        x = torch.cat([track_left, track_right], dim=1)   # (b, 2*n_track, 2)
-        x = x.reshape(b, -1)                              # (b, 4*n_track)
-        out = self.net(x)                                 # (b, n_waypoints*2)
+
+        # Extra features
+        center = 0.5 * (track_left + track_right)   # (b, n_track, 2)
+        width  = (track_right - track_left)         # (b, n_track, 2)
+
+        # Concatenate: left, right, center, width  -> (b, 4*n_track, 2)
+        x = torch.cat([track_left, track_right, center, width], dim=1)
+
+        # Flatten to (b, in_dim) where in_dim = n_track * 4 * 2
+        x = x.reshape(b, -1)
+
+        out = self.net(x)                            # (b, n_waypoints*2)
         return out.view(b, self.n_waypoints, 2)
+
         #raise NotImplementedError
 
 

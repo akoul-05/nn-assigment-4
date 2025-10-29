@@ -189,16 +189,24 @@ def forward_model(model: torch.nn.Module, batch: dict, device: torch.device) -> 
         )
 
 
-def compute_loss(pred: torch.Tensor, batch: dict, device: torch.device) -> torch.Tensor:
-    target = batch["waypoints"].to(device)                  # (B, 3, 2)
-    mask = batch.get("waypoints_mask", None)                # (B, 3) or None
-    loss = F.l1_loss(pred, target, reduction="none")        # (B, 3, 2)
+def compute_loss(pred, batch, device):
+    target = batch["waypoints"].to(device)        # (B, 3, 2)
+    mask = batch.get("waypoints_mask", None)      # (B, 3) or None
+
+    abs_err = (pred - target).abs()               # (B, 3, 2)
+
+    # ↑ If dim 0 is longitudinal and dim 1 is lateral per your metric naming,
+    # increase weight on the *lateral* component (index 1):
+    comp_weight = torch.tensor([1.0, 1.5], device=device)  # [long, lat]
+    abs_err = abs_err * comp_weight.view(1, 1, 2)
+
     if mask is not None:
-        m = mask.to(device)[..., None].float()              # (B, 3, 1)
-        loss = (loss * m).sum() / m.sum().clamp_min(1.0)
+        m = mask.to(device)[..., None].float()    # (B, 3, 1)
+        loss = (abs_err * m).sum() / m.sum().clamp_min(1.0)
     else:
-        loss = loss.mean()
+        loss = abs_err.mean()
     return loss
+
 
 
 @torch.no_grad()
