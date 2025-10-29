@@ -20,6 +20,9 @@ from homework.models import load_model, save_model
 from homework.datasets.road_dataset import RoadDataset
 from homework.metrics import PlannerMetric
 
+from pathlib import Path
+from torch.utils.data import DataLoader, ConcatDataset, random_split
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -42,67 +45,61 @@ def set_seed(seed: int):
 
 def build_loaders(batch_size: int, num_workers: int, device: torch.device):
     """
-    Tries common constructor signatures for RoadDataset:
-      - RoadDataset(split="train"/"val")
-      - RoadDataset(partition=...)
-      - RoadDataset(split_name=...)
-      - RoadDataset(mode=...)
-      - RoadDataset(train=True/False)
-    Falls back to: RoadDataset() then random 90/10 split.
+    Build datasets by scanning drive_data/ for per-episode paths and
+    instantiating RoadDataset(episode_path=...) for each.
     """
     pin = device.type == "cuda"
 
-    # Try multiple constructor styles
-    def _try_ctor(argname, train_val_mapper):
-        try:
-            train_ds = RoadDataset(**{argname: train_val_mapper("train")})
-            val_ds   = RoadDataset(**{argname: train_val_mapper("val")})
-            print(f"[build_loaders] Using RoadDataset({argname}=...)")
-            return train_ds, val_ds
-        except TypeError:
-            return None
-        except Exception:
-            return None
+    root = Path("drive_data")
+    if not root.exists():
+        raise FileNotFoundError("drive_data/ not found. Did you unzip the dataset in the repo root?")
 
-    # 1) split="train"/"val"
-    pair = _try_ctor("split", lambda s: s)
-    if pair is None:
-        # 2) partition="train"/"val"
-        pair = _try_ctor("partition", lambda s: s)
-    if pair is None:
-        # 3) split_name="train"/"val"
-        pair = _try_ctor("split_name", lambda s: s)
-    if pair is None:
-        # 4) mode="train"/"val"
-        pair = _try_ctor("mode", lambda s: s)
-    if pair is None:
-        # 5) train=True/False
-        try:
-            train_ds = RoadDataset(train=True)
-            val_ds   = RoadDataset(train=False)
-            print("[build_loaders] Using RoadDataset(train=True/False)")
-            pair = (train_ds, val_ds)
-        except TypeError:
-            pair = None
-        except Exception:
-            pair = None
+    # 1) Collect candidate episode paths
+    #    First try subdirectories (most common), else look for episode files.
+    episode_dirs = [p for p in root.iterdir() if p.is_dir()]
+    episode_files = list(root.glob("*.npz")) + list(root.glob("*.pkl")) + list(root.glob("*.pt"))
 
-    if pair is None:
-        # 6) Fallback: single dataset → random split
+    candidates = sorted(episode_dirs if episode_dirs else episode_files)
+    if not candidates:
+        # Last resort: deep search
+        candidates = sorted([p for p in root.rglob("*") if p.is_dir()])
+    if not candidates:
+        raise RuntimeError(
+            "No episode paths found under drive_data/. "
+            "List its contents and ensure you downloaded + unzipped correctly."
+        )
+
+    # 2) Try to instantiate RoadDataset for each candidate
+    datasets = []
+    for p in candidates:
         try:
-            base = RoadDataset()
-            n = len(base)
-            n_train = max(1, int(0.9 * n))
-            n_val = max(1, n - n_train)
-            gen = torch.Generator().manual_seed(1337)
-            train_ds, val_ds = random_split(base, [n_train, n_val], generator=gen)
-            print(f"[build_loaders] Using RoadDataset() and random_split {n_train}/{n_val}")
-        except Exception as e:
-            raise RuntimeError(
-                f"Could not construct RoadDataset with any known signature; original error: {e}"
-            )
-    else:
-        train_ds, val_ds = pair
+            ds = RoadDataset(episode_path=str(p))
+            datasets.append(ds)
+        except TypeError:
+            # signature mismatch? skip this candidate
+            continue
+        except Exception:
+            # bad episode? skip
+            continue
+
+    if not datasets:
+        # Helpful diagnostics
+        sample = "\n".join([str(p) for p in candidates[:10]])
+        raise RuntimeError(
+            "Could not instantiate any RoadDataset(episode_path=...). "
+            f"Tried {len(candidates)} candidates, e.g.:\n{sample}\n"
+            "Open homework/datasets/road_dataset.py and check __init__ signature; "
+            "adjust build_loaders accordingly."
+        )
+
+    full = ConcatDataset(datasets)
+
+    # 3) Train/val split
+    n = len(full)
+    n_train = max(1, int(0.9 * n))
+    n_val = max(1, n - n_train)
+    gen = torch.Generator().manual_seed(1337)
+    train_ds, val_ds = random_split(full, [n_train, n_val], generator=gen)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
@@ -112,9 +109,8 @@ def build_loaders(batch_size: int, num_workers: int, device: torch.device):
         val_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=pin
     )
+    print(f"[build_loaders] episodes={len(datasets)} | samples total={n} | split {n_train}/{n_val}")
     return train_loader, val_loader
-
-
 
 def forward_model(model: torch.nn.Module, batch: dict, device: torch.device) -> torch.Tensor:
     name = model.__class__.__name__.lower()
