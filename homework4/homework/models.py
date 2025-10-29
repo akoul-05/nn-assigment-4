@@ -77,36 +77,62 @@ class MLPPlanner(nn.Module):
 
         #raise NotImplementedError
 
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, dim: int, max_len: int = 64):
+        super().__init__()
+        pe = torch.zeros(max_len, dim)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, dim)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, L, D) -> add pe[:, :L]
+        """
+        L = x.size(1)
+        return x + self.pe[:, :L, :]
+    
 class TransformerPlanner(nn.Module):
     def __init__(
         self,
         n_track: int = 10,
         n_waypoints: int = 3,
-        d_model: int = 64,
-        nhead: int = 4,
-        num_layers: int = 2,
-        dim_feedforward: int = 128,
+        d_model: int = 128,
+        nhead: int = 8,
+        num_layers: int = 3,
+        dim_feedforward: int = 256,
         dropout: float = 0.1,
     ):
         super().__init__()
 
         self.n_track = n_track
         self.n_waypoints = n_waypoints
-
-        #self.query_embed = nn.Embedding(n_waypoints, d_model)
-
         self.d_model = d_model
 
+        # ------------------------------------------------------------------
+        # Encode each boundary point with richer features
+        # Raw per-point inputs we'll build in forward():
+        # [x, y, cx, cy, wx, wy, arc_pos]  -> 7 dims
+        in_feat = 7
         self.point_encoder = nn.Sequential(
-            nn.Linear(2, d_model),
+            nn.Linear(in_feat, d_model),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(d_model, d_model),
         )
 
+        # Side embedding (left=0, right=1)
         self.side_embed = nn.Embedding(2, d_model)
+
+        # Sinusoidal PE for along-track index (shared across sides)
+        self.pos_enc = SinusoidalPositionalEncoding(d_model, max_len=2 * n_track + 8)
+
+        # Learned waypoint queries
         self.query_embed = nn.Embedding(n_waypoints, d_model)
 
+        # Transformer decoder (queries attend to memory)
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -117,8 +143,15 @@ class TransformerPlanner(nn.Module):
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
-        # Project query output to (x,y)
-        self.head = nn.Linear(d_model, 2)
+        # Normalizations
+        self.mem_norm = nn.LayerNorm(d_model)
+        self.q_norm = nn.LayerNorm(d_model)
+
+        # Head to (x, y)
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, 2),
+        )
 
     def forward(
         self,
@@ -139,26 +172,44 @@ class TransformerPlanner(nn.Module):
         Returns:
             torch.Tensor: future waypoints with shape (b, n_waypoints, 2)
         """
-        b = track_left.size(0)
+        B, T, _ = track_left.shape  # T == n_track
 
-        mem_xy = torch.cat([track_left, track_right], dim=1)     
-        mem = self.point_encoder(mem_xy)
+        # Center & width features
+        center = 0.5 * (track_left + track_right)   # (B, T, 2)
+        width = (track_right - track_left)          # (B, T, 2)
 
-        side_ids = torch.cat(
-            [
-                torch.zeros((b, self.n_track), dtype=torch.long, device=mem.device),
-                torch.ones((b, self.n_track), dtype=torch.long, device=mem.device),
-            ],
-            dim=1,
-        )
-        mem = mem + self.side_embed(side_ids)
+        # Along-track "arc" positions (0..T-1) normalized
+        arc = torch.linspace(0, 1, steps=T, device=track_left.device).view(1, T, 1).expand(B, T, 1)
 
-        # Queries
-        q = self.query_embed.weight.unsqueeze(0).expand(b, -1, -1)
+        # Build feature tensors for left and right sides
+        # left: side_id = 0, right: side_id = 1 (we’ll add side embedding later)
+        left_feat = torch.cat([track_left, center, width, arc], dim=-1)   # (B, T, 7)
+        right_feat = torch.cat([track_right, center, width, arc], dim=-1) # (B, T, 7)
 
-        # Cross-attention
-        dec = self.decoder(tgt=q, memory=mem)
-        out = self.head(dec)
+        # Encode points
+        left_mem = self.point_encoder(left_feat)     # (B, T, D)
+        right_mem = self.point_encoder(right_feat)   # (B, T, D)
+
+        # Add side embeddings
+        left_mem  = left_mem  + self.side_embed.weight[0].view(1, 1, -1)
+        right_mem = right_mem + self.side_embed.weight[1].view(1, 1, -1)
+
+        # Concatenate memory: keep left then right order
+        mem = torch.cat([left_mem, right_mem], dim=1)    # (B, 2T, D)
+
+        # Add sinusoidal positional encoding (based on index 0..2T-1)
+        mem = self.pos_enc(mem)
+        mem = self.mem_norm(mem)
+
+        # Waypoint queries (same learned queries broadcast across batch)
+        q = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)  # (B, n_waypoints, D)
+        q = self.q_norm(q)
+
+        # Decode (cross-attention)
+        dec = self.decoder(tgt=q, memory=mem)             # (B, n_waypoints, D)
+
+        # Project to (x, y)
+        out = self.head(dec)                               # (B, n_waypoints, 2)
         return out
         #raise NotImplementedError
 
