@@ -11,7 +11,7 @@ Usage:
 import argparse
 import math
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +21,10 @@ from homework.models import load_model, save_model
 from homework.datasets.road_dataset import RoadDataset
 from homework.metrics import PlannerMetric
 
+
+# ---------------------------
+# Arg parsing / seeding
+# ---------------------------
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -45,7 +49,7 @@ def set_seed(seed: int):
 # Dataset discovery utilities
 # ---------------------------
 
-_EP_EXTS = (".npz", ".npy", ".pkl", ".pt", ".json", ".jsonl")
+EP_KEY_FILE = "info.npz"  # file that marks an episode directory (e.g., drive_data/train/*/info.npz)
 
 
 def _possible_roots() -> list[Path]:
@@ -67,68 +71,65 @@ def _find_drive_data_root() -> Path:
     )
 
 
-def _collect_episode_files(split_dir: Path) -> list[Path]:
+def _collect_episode_dirs(split_dir: Path) -> list[Path]:
     """
-    Collect per-episode file paths (or directories treated as episodes) under split_dir.
-    We prefer data files with common extensions; if none, fall back to subdirectories.
+    Find episode directories by locating */info.npz and returning their parents.
     """
-    files = []
-    for ext in _EP_EXTS:
-        files.extend(split_dir.rglob(f"*{ext}"))
-    files = sorted({p for p in files if p.is_file()})
+    info_files = list(split_dir.rglob(EP_KEY_FILE))
+    ep_dirs = sorted({p.parent for p in info_files if p.is_file()})
+    if ep_dirs:
+        return ep_dirs
 
-    if files:
-        return files
+    # Fallback: any subdir that contains the key file
+    candidates = []
+    for d in sorted([p for p in split_dir.rglob("*") if p.is_dir()]):
+        if (d / EP_KEY_FILE).exists():
+            candidates.append(d)
+    return candidates
 
-    # Fallback: treat immediate subdirs as episodes
-    subdirs = sorted([p for p in split_dir.iterdir() if p.is_dir()])
-    return subdirs
 
-
-def _try_instantiate_episode(ep_path: Path):
+def _try_instantiate_episode(ep_dir: Path):
     """
-    Try common constructor signatures for a single episode.
+    Try common constructor signatures using the EPISODE DIRECTORY.
     Returns a RoadDataset or None.
     """
-    # 1) episode_path=
+    # Most common: episode_path=<dir>
     try:
-        return RoadDataset(episode_path=str(ep_path))
+        return RoadDataset(episode_path=str(ep_dir))
     except TypeError:
         pass
     except Exception:
         return None
 
-    # 2) path=
-    try:
-        return RoadDataset(path=str(ep_path))
-    except Exception:
-        return None
-
-    # 3) dir=  (rare)
-    try:
-        return RoadDataset(dir=str(ep_path))
-    except Exception:
-        return None
+    # Other names some repos use
+    for kw in ("path", "dir", "episode_dir"):
+        try:
+            return RoadDataset(**{kw: str(ep_dir)})
+        except Exception:
+            continue
+    return None
 
 
 def _build_split_dataset(split_dir: Path) -> ConcatDataset:
-    ep_candidates = _collect_episode_files(split_dir)
-    if not ep_candidates:
-        raise RuntimeError(f"No episode files/dirs found under {split_dir}")
+    ep_dirs = _collect_episode_dirs(split_dir)
+    if not ep_dirs:
+        raise RuntimeError(
+            f"No episode directories found under {split_dir} (looked for */{EP_KEY_FILE})."
+        )
 
     datasets = []
-    for p in ep_candidates:
-        ds = _try_instantiate_episode(p)
+    for d in ep_dirs:
+        ds = _try_instantiate_episode(d)
         if ds is not None:
             datasets.append(ds)
 
     if not datasets:
-        sample = "\n".join(str(p) for p in ep_candidates[:10])
+        sample = "\n".join(str(p) for p in ep_dirs[:10])
         raise RuntimeError(
-            f"Could not instantiate RoadDataset for any candidate under {split_dir}.\n"
-            f"Tried {len(ep_candidates)} paths, sample:\n{sample}\n"
-            "Open homework/datasets/road_dataset.py and check __init__ signature; "
-            "adjust _try_instantiate_episode() param name accordingly."
+            f"Could not instantiate RoadDataset for any episode dir under {split_dir}.\n"
+            f"Tried {len(ep_dirs)} dirs, e.g.:\n{sample}\n"
+            "Open homework/datasets/road_dataset.py and confirm the parameter name. "
+            "Supported keys here: episode_path / path / dir / episode_dir."
         )
 
     return ConcatDataset(datasets)
@@ -137,9 +138,9 @@ def _build_split_dataset(split_dir: Path) -> ConcatDataset:
 def build_loaders(batch_size: int, num_workers: int, device: torch.device):
     """
     Build train/val loaders by scanning:
-        drive_data/train/**  and  drive_data/val/**
-    for episode files/dirs, instantiating one dataset per episode, then concatenating.
-    Falls back to a single dataset split if no explicit train/val dirs exist.
+        drive_data/train/*/info.npz  and  drive_data/val/*/info.npz
+    and instantiating one RoadDataset per episode directory. If no explicit split
+    exists, build from the whole root and perform a 90/10 random split.
     """
     pin = device.type == "cuda"
     root = _find_drive_data_root()
@@ -231,7 +232,7 @@ def main():
     device = torch.device(args.device)
     print(f"Training {args.model} on {device} for {args.epochs} epochs")
 
-    # Heuristic weight decay default (slightly lower for MLP)
+    # Heuristic: slightly lower default WD for MLP unless overridden
     wd = 0.01 if (args.model == "mlp_planner" and args.weight_decay == 0.05) else args.weight_decay
 
     model = load_model(args.model).to(device)
