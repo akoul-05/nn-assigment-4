@@ -6,9 +6,6 @@ HOMEWORK_DIR = Path(__file__).resolve().parent
 INPUT_MEAN = [0.2788, 0.2657, 0.2629]
 INPUT_STD  = [0.2064, 0.1944, 0.2252]
 
-# ----------------------------
-# Part 1a: MLP Planner (simplified)
-# ----------------------------
 class MLPPlanner(nn.Module):
     """
     Predicts n_waypoints 2D points from track boundaries using a small MLP.
@@ -18,7 +15,7 @@ class MLPPlanner(nn.Module):
         super().__init__()
         self.n_track = n_track
         self.n_waypoints = n_waypoints
-        in_dim = n_track * 2 * 2  # (left xy + right xy) * n_track
+        in_dim = n_track * 2 * 2
 
         self.net = nn.Sequential(
             nn.LayerNorm(in_dim),
@@ -31,16 +28,11 @@ class MLPPlanner(nn.Module):
 
     def forward(self, track_left: torch.Tensor, track_right: torch.Tensor, **_) -> torch.Tensor:
         b = track_left.size(0)
-        # concat left/right -> flatten
-        x = torch.cat([track_left, track_right], dim=1)   # (b, 2*n_track, 2)
-        x = x.reshape(b, -1)                              # (b, 4*n_track)
-        out = self.net(x)                                 # (b, n_waypoints*2)
+        x = torch.cat([track_left, track_right], dim=1)
+        x = x.reshape(b, -1)
+        out = self.net(x)
         return out.view(b, self.n_waypoints, 2)
 
-
-# ----------------------------
-# Part 1b: Transformer Planner (simplified, no sin/cos; learned index embedding)
-# ----------------------------
 class TransformerPlanner(nn.Module):
     """
     Decoder-only transformer that attends learned waypoint queries over a memory
@@ -62,16 +54,14 @@ class TransformerPlanner(nn.Module):
         self.n_waypoints = n_waypoints
         self.d_model = d_model
 
-        in_feat = 3  # x, y, side_flag
+        in_feat = 3
         self.point_proj = nn.Sequential(
             nn.Linear(in_feat, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
 
-        # learned position embedding over the 2*n_track memory tokens
         self.pos_embed = nn.Embedding(2 * n_track, d_model)
-        # learned queries for waypoints
         self.query_embed = nn.Embedding(n_waypoints, d_model)
 
         dec_layer = nn.TransformerDecoderLayer(
@@ -100,33 +90,23 @@ class TransformerPlanner(nn.Module):
         """
         B, T, _ = track_left.shape
         device = track_left.device
-
-        # memory tokens = [left_0..left_T-1, right_0..right_T-1]
-        mem_xy   = torch.cat([track_left, track_right], dim=1)  # (B, 2T, 2)
+        mem_xy   = torch.cat([track_left, track_right], dim=1)
         side_l   = torch.zeros(B, T, 1, device=device)
         side_r   = torch.ones(B,  T, 1, device=device)
-        mem_side = torch.cat([side_l, side_r], dim=1)           # (B, 2T, 1)
-
-        mem_feat = torch.cat([mem_xy, mem_side], dim=-1)        # (B, 2T, 3)
-        mem      = self.point_proj(mem_feat)                    # (B, 2T, D)
-
-        # add learned index embeddings
-        idx = torch.arange(2 * T, device=device).unsqueeze(0).expand(B, -1)  # (B, 2T)
+        mem_side = torch.cat([side_l, side_r], dim=1)
+        mem_feat = torch.cat([mem_xy, mem_side], dim=-1)
+        mem      = self.point_proj(mem_feat)
+        idx = torch.arange(2 * T, device=device).unsqueeze(0).expand(B, -1)
         mem = mem + self.pos_embed(idx)
         mem = self.mem_norm(mem)
 
-        # queries (one per waypoint)
-        q = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)           # (B, n_waypoints, D)
+        q = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)
         q = self.q_norm(q)
 
-        dec = self.decoder(tgt=q, memory=mem)                                # (B, n_waypoints, D)
-        out = self.head(dec)                                                 # (B, n_waypoints, 2)
+        dec = self.decoder(tgt=q, memory=mem)
+        out = self.head(dec)
         return out
 
-
-# ----------------------------
-# Part 2: Vision Transformer Planner (kept lean; learned pos + avg pool)
-# ----------------------------
 class PatchEmbedding(nn.Module):
     """
     Simple patchification via Conv2d (kernel=stride=patch_size), then flatten to tokens.
@@ -139,7 +119,6 @@ class PatchEmbedding(nn.Module):
         self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, H, W) -> (B, E, H/p, W/p) -> (B, N, E)
         x = self.proj(x)
         x = x.flatten(2).transpose(1, 2)
         return x
@@ -199,8 +178,6 @@ class ViTPlanner(nn.Module):
 
         self.patch_embed = PatchEmbedding(img_h, img_w, patch_size, 3, embed_dim)
         num_patches = self.patch_embed.num_patches
-
-        # learned positional embeddings (no sin/cos)
         self.pos = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
 
         self.blocks = nn.Sequential(*[
@@ -229,25 +206,15 @@ class ViTPlanner(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, image: torch.Tensor, **_) -> torch.Tensor:
-        # 1) normalize to dataset stats
         x = (image - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
-        # 2) to patch tokens
-        x = self.patch_embed(x)                     # (B, N, E)
-        # 3) add learned pos
+        x = self.patch_embed(x)
         x = x + self.pos[:, : x.size(1), :]
-        # 4) transformer encoder
         x = self.blocks(x)
         x = self.norm(x)
-        # 5) global average pool over tokens
-        x = x.mean(dim=1)                           # (B, E)
-        # 6) project to waypoints
-        out = self.head(x)                          # (B, 2*n_waypoints)
+        x = x.mean(dim=1)
+        out = self.head(x)
         return out.view(x.size(0), self.n_waypoints, 2)
 
-
-# ----------------------------
-# Loader / Saver (unchanged)
-# ----------------------------
 MODEL_FACTORY = {
     "mlp_planner": MLPPlanner,
     "transformer_planner": TransformerPlanner,
@@ -267,7 +234,6 @@ def load_model(model_name: str, with_weights: bool = False, **model_kwargs) -> n
                 f"Failed to load {model_path.name}, ensure default model args match the saved weights."
             ) from e
 
-    # enforce bundle size
     model_size_mb = calculate_model_size_mb(m)
     if model_size_mb > 20:
         raise AssertionError(f"{model_name} is too large: {model_size_mb:.2f} MB")

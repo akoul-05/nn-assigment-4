@@ -1,21 +1,13 @@
-# homework/trainer.py
-# Train MLP / Transformer / ViT planners and save the LAST checkpoint only.
-
 from pathlib import Path
 import argparse
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, ConcatDataset, random_split
-
 from homework.models import load_model
 from homework.datasets.road_dataset import RoadDataset
 
-EP_KEY = "info.npz"  # episode marker
+EP_KEY = "info.npz"
 
-
-# ---------------------------
-# CLI
-# ---------------------------
 def parse_args():
     ap = argparse.ArgumentParser("Simple planner trainer (save LAST only)")
     ap.add_argument("--model", required=True,
@@ -34,10 +26,6 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
-# ---------------------------
-# Data
-# ---------------------------
 def _episodes(root: Path):
     return sorted({p.parent for p in root.rglob(EP_KEY)})
 
@@ -75,10 +63,6 @@ def make_loaders(batch_size: int, num_workers: int, device: torch.device):
     print(f"[data] train≈{len(train_ds)} | val≈{len(val_ds)}")
     return train_loader, val_loader
 
-
-# ---------------------------
-# Train helpers
-# ---------------------------
 def forward_model(model: torch.nn.Module, batch: dict, device: torch.device):
     name = model.__class__.__name__.lower()
     if "vit" in name:
@@ -89,18 +73,12 @@ def forward_model(model: torch.nn.Module, batch: dict, device: torch.device):
 def loss_fn(pred: torch.Tensor, batch: dict, device: torch.device):
     target = batch["waypoints"].to(device)
     mask = batch.get("waypoints_mask", None)
-
-    # simple Smooth L1; you can weight lateral more if you want
-    loss = F.smooth_l1_loss(pred, target, beta=0.1, reduction="none")  # (B, 3, 2)
+    loss = F.smooth_l1_loss(pred, target, beta=0.1, reduction="none")
     if mask is not None:
         m = mask.to(device)[..., None].float()
         return (loss * m).sum() / m.sum().clamp_min(1.0)
     return loss.mean()
 
-
-# ---------------------------
-# Main
-# ---------------------------
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -113,7 +91,6 @@ def main():
 
     train_loader, val_loader = make_loaders(args.batch_size, args.num_workers, device)
 
-    # where the grader expects weights
     out_path = Path(__file__).resolve().parent / f"{args.model}.th"
 
     for epoch in range(1, args.epochs + 1):
@@ -133,7 +110,6 @@ def main():
             if step % 50 == 0:
                 print(f"[{epoch} | {step}/{len(train_loader)}] train_loss={running/max(1,seen):.4f}")
 
-        # (optional) quick val loss for visibility; we still save LAST only
         with torch.no_grad():
             model.eval()
             tot, cnt = 0.0, 0
@@ -145,12 +121,9 @@ def main():
                 cnt += bsz
             print(f"[{epoch}] val_loss={tot/max(1,cnt):.4f}")
 
-        # save LAST every epoch (overwrites)
         torch.save(model.state_dict(), out_path)
-        print(f"[save] wrote LAST → {out_path.name}")
 
-    print("[done] training complete; LAST weights saved.")
-
+    print("[done] training complete.")
 
 if __name__ == "__main__":
     main()
