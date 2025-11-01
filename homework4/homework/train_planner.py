@@ -7,7 +7,7 @@ from homework.models import load_model
 from homework.datasets.road_dataset import RoadDataset
 
 EP_KEY = "info.npz"
-
+# Used chatgpt and copilot to help with the code below
 def parse_args():
     ap = argparse.ArgumentParser("Simple planner trainer (save LAST only)")
     ap.add_argument("--model", required=True,

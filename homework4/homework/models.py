@@ -2,6 +2,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+# Used chatgpt and copilot to help with the code below
+
 HOMEWORK_DIR = Path(__file__).resolve().parent
 INPUT_MEAN = [0.2788, 0.2657, 0.2629]
 INPUT_STD  = [0.2064, 0.1944, 0.2252]
